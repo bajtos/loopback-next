@@ -4,19 +4,40 @@
 // License text available at https://opensource.org/licenses/MIT
 
 import {expect} from '@loopback/testlab';
+import axios, {AxiosProxyConfig, AxiosRequestConfig} from 'axios';
 import delay from 'delay';
 import http from 'http';
 import {AddressInfo} from 'net';
 import pEvent from 'p-event';
 import path from 'path';
-import makeRequest from 'request-promise-native';
 import rimrafCb from 'rimraf';
+import tunnel, {ProxyOptions as TunnelProxyOptions} from 'tunnel';
+import {URL} from 'url';
 import util from 'util';
 import {HttpCachingProxy, ProxyOptions} from '../../http-caching-proxy';
 
 const CACHE_DIR = path.join(__dirname, '.cache');
 
 const rimraf = util.promisify(rimrafCb);
+
+const axiosInstance = axios.create({
+  // Provide a custom function to control when Axios throws errors based on
+  // http status code. Please note that Axios creates a new error in such
+  // condition and the original low-level error is lost
+  validateStatus: () => true,
+});
+
+const makeRequest = async (config: AxiosRequestConfig) => {
+  const res = await axiosInstance(config);
+  // Throw an error with message from the original error
+  if (res.status >= 300) {
+    const err = new Error(`${res.status} - ${res.data}`);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (err as any).status = res.status;
+    throw err;
+  }
+  return res;
+};
 
 describe('HttpCachingProxy', () => {
   let stubServerUrl: string;
@@ -45,13 +66,12 @@ describe('HttpCachingProxy', () => {
 
     await givenRunningProxy();
     const result = await makeRequest({
-      uri: 'http://example.com',
-      proxy: proxy.url,
-      resolveWithFullResponse: true,
+      url: 'http://example.com',
+      proxy: getProxyConfig(),
     });
 
-    expect(result.statusCode).to.equal(200);
-    expect(result.body).to.containEql('example');
+    expect(result.status).to.equal(200);
+    expect(result.data).to.containEql('example');
   });
 
   it('reports error for HTTP requests', async function() {
@@ -62,15 +82,14 @@ describe('HttpCachingProxy', () => {
     await givenRunningProxy({logError: false});
     await expect(
       makeRequest({
-        uri: 'http://does-not-exist.example.com',
-        proxy: proxy.url,
-        resolveWithFullResponse: true,
+        url: 'http://does-not-exist.example.com',
+        proxy: getProxyConfig(),
       }),
     ).to.be.rejectedWith(
       // The error can be
       // '502 - "Error: getaddrinfo EAI_AGAIN does-not-exist.example.com:80"'
       // '502 - "Error: getaddrinfo ENOTFOUND does-not-exist.example.com'
-      /502 - "Error\: getaddrinfo/,
+      /502 - getaddrinfo/,
     );
   });
 
@@ -78,12 +97,11 @@ describe('HttpCachingProxy', () => {
     await givenRunningProxy({logError: false, timeout: 1});
     await expect(
       makeRequest({
-        uri:
+        url:
           'http://www.mocky.io/v2/5dade5e72d0000a542e4bd9c?mocky-delay=1000ms',
-        proxy: proxy.url,
-        resolveWithFullResponse: true,
+        proxy: getProxyConfig(),
       }),
-    ).to.be.rejectedWith(/502 - "Error: ETIMEDOUT"/);
+    ).to.be.rejectedWith(/502 - timeout of 1ms exceeded/);
   });
 
   it('proxies HTTPs requests (no tunneling)', async function() {
@@ -93,28 +111,25 @@ describe('HttpCachingProxy', () => {
 
     await givenRunningProxy();
     const result = await makeRequest({
-      uri: 'https://example.com',
-      proxy: proxy.url,
-      tunnel: false,
-      resolveWithFullResponse: true,
+      url: 'https://example.com',
+      proxy: getProxyConfig(),
     });
 
-    expect(result.statusCode).to.equal(200);
-    expect(result.body).to.containEql('example');
+    expect(result.status).to.equal(200);
+    expect(result.data).to.containEql('example');
   });
 
   it('rejects CONNECT requests (HTTPS tunneling)', async () => {
     await givenRunningProxy();
+    const agent = tunnel.httpsOverHttp({proxy: getTunnelProxyConfig()});
     const resultPromise = makeRequest({
-      uri: 'https://example.com',
-      proxy: proxy.url,
-      tunnel: true,
-      simple: false,
-      resolveWithFullResponse: true,
+      url: 'https://example.com',
+      httpsAgent: agent,
+      proxy: false,
     });
 
     await expect(resultPromise).to.be.rejectedWith(
-      /tunneling socket.*statusCode=501/,
+      /tunneling socket could not be established, statusCode=501/,
     );
   });
 
@@ -123,17 +138,16 @@ describe('HttpCachingProxy', () => {
     givenServerDumpsRequests();
 
     const result = await makeRequest({
-      uri: stubServerUrl,
-      json: true,
+      url: stubServerUrl,
+      responseType: 'json',
       headers: {'x-client': 'test'},
-      proxy: proxy.url,
-      resolveWithFullResponse: true,
+      proxy: getProxyConfig(),
     });
 
     expect(result.headers).to.containEql({
       'x-server': 'dumping-server',
     });
-    expect(result.body.headers).to.containDeep({
+    expect(result.data.headers).to.containDeep({
       'x-client': 'test',
     });
   });
@@ -144,12 +158,12 @@ describe('HttpCachingProxy', () => {
 
     const result = await makeRequest({
       method: 'POST',
-      uri: stubServerUrl,
-      body: 'a text body',
-      proxy: proxy.url,
+      url: stubServerUrl,
+      data: 'a text body',
+      proxy: getProxyConfig(),
     });
 
-    expect(result).to.equal('a text body');
+    expect(result.data).to.equal('a text body');
   });
 
   it('caches responses', async () => {
@@ -161,19 +175,19 @@ describe('HttpCachingProxy', () => {
     };
 
     const opts = {
-      uri: stubServerUrl,
+      url: stubServerUrl,
       json: true,
-      proxy: proxy.url,
+      proxy: getProxyConfig(),
       resolveWithFullResponse: true,
     };
 
     const result1 = await makeRequest(opts);
     const result2 = await makeRequest(opts);
 
-    expect(result1.statusCode).equal(201);
+    expect(result1.status).equal(201);
 
-    expect(result1.statusCode).equal(result2.statusCode);
-    expect(result1.body).deepEqual(result2.body);
+    expect(result1.status).equal(result2.status);
+    expect(result1.data).deepEqual(result2.data);
     expect(result1.headers).deepEqual(result2.headers);
   });
 
@@ -184,24 +198,24 @@ describe('HttpCachingProxy', () => {
     stubServerHandler = (req, res) => res.end(String(counter++));
 
     const opts = {
-      uri: stubServerUrl,
-      proxy: proxy.url,
+      url: stubServerUrl,
+      proxy: getProxyConfig(),
     };
 
     const result1 = await makeRequest(opts);
     await delay(10);
     const result2 = await makeRequest(opts);
 
-    expect(result1).to.equal('1');
-    expect(result2).to.equal('2');
+    expect(result1.data).to.equal(1);
+    expect(result2.data).to.equal(2);
   });
 
   it('handles the case where backend service is not running', async () => {
     await givenRunningProxy({logError: false});
 
     await expect(
-      makeRequest({uri: 'http://127.0.0.1:1/', proxy: proxy.url}),
-    ).to.be.rejectedWith({statusCode: 502});
+      makeRequest({url: 'http://127.0.0.1:1/', proxy: getProxyConfig()}),
+    ).to.be.rejectedWith({status: 502});
   });
 
   async function givenRunningProxy(options?: Partial<ProxyOptions>) {
@@ -214,6 +228,31 @@ describe('HttpCachingProxy', () => {
   async function stopProxy() {
     if (!proxy) return;
     await proxy.stop();
+  }
+
+  function getProxyConfig(): AxiosProxyConfig {
+    const parsed = new URL(proxy.url);
+    return {
+      host: parsed.hostname,
+      port: parseInt(parsed.port),
+      protocol: parsed.protocol,
+      auth: {
+        username: parsed.username,
+        password: parsed.password,
+      },
+    };
+  }
+
+  function getTunnelProxyConfig(): TunnelProxyOptions {
+    const parsed = new URL(proxy.url);
+    const options: TunnelProxyOptions = {
+      host: parsed.hostname,
+      port: parseInt(parsed.port),
+    };
+    if (parsed.username) {
+      options.proxyAuth = `${parsed.username}:${parsed.password}`;
+    }
+    return options;
   }
 
   let stubServer: http.Server | undefined,

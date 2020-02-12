@@ -3,6 +3,7 @@
 // This file is licensed under the MIT License.
 // License text available at https://opensource.org/licenses/MIT
 
+import axios, {AxiosInstance, AxiosResponse, Method} from 'axios';
 import debugFactory from 'debug';
 import {
   createServer,
@@ -13,7 +14,6 @@ import {
 } from 'http';
 import {AddressInfo} from 'net';
 import pEvent from 'p-event';
-import makeRequest from 'request-promise-native';
 
 const cacache = require('cacache');
 
@@ -67,6 +67,7 @@ interface CachedMetadata {
  * The HTTP proxy implementation.
  */
 export class HttpCachingProxy {
+  private _axios: AxiosInstance;
   private _options: Required<ProxyOptions>;
   private _server?: HttpServer;
 
@@ -83,6 +84,12 @@ export class HttpCachingProxy {
     }
     this.url = 'http://proxy-not-running';
     this._server = undefined;
+    this._axios = axios.create({
+      // Provide a custom function to control when Axios throws errors based on
+      // http status code. Please note that Axios creates a new error in such
+      // condition and the original low-level error is lost
+      validateStatus: () => true,
+    });
   }
 
   /**
@@ -96,6 +103,7 @@ export class HttpCachingProxy {
     );
 
     this._server.on('connect', (req, socket) => {
+      // Reject tunneling requests
       socket.write('HTTP/1.1 501 Not Implemented\r\n\r\n');
       socket.destroy();
     });
@@ -124,7 +132,8 @@ export class HttpCachingProxy {
   private _handle(request: IncomingMessage, response: ServerResponse) {
     const onerror = (error: Error) => {
       this.logError(request, error);
-      response.statusCode = error.name === 'RequestError' ? 502 : 500;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      response.statusCode = (error as any).statusCode || 502;
       response.end(error.message);
     };
 
@@ -187,27 +196,43 @@ export class HttpCachingProxy {
     clientResponse: ServerResponse,
   ) {
     debug('Forward request to %s %s', clientRequest.method, clientRequest.url);
-    const backendResponse = await makeRequest({
-      resolveWithFullResponse: true,
-      simple: false,
+    let backendResponse: AxiosResponse;
+    try {
+      backendResponse = await this._axios({
+        method: clientRequest.method as Method,
+        url: clientRequest.url!,
+        headers: clientRequest.headers,
+        data: clientRequest,
+        timeout: this._options.timeout || undefined,
+      });
 
-      method: clientRequest.method,
-      uri: clientRequest.url!,
-      headers: clientRequest.headers,
-      body: clientRequest,
-      timeout: this._options.timeout || undefined,
-    });
+      debug(
+        'Got response for %s %s -> %s',
+        clientRequest.method,
+        clientRequest.url,
+        backendResponse.status,
+        backendResponse.headers,
+        backendResponse.data,
+      );
+    } catch (err) {
+      debug(
+        'Error sending request %s %s',
+        clientRequest.method,
+        clientRequest.url,
+        err,
+      );
+      throw err;
+    }
 
-    debug(
-      'Got response for %s %s -> %s',
-      clientRequest.method,
-      clientRequest.url,
-      backendResponse.statusCode,
-      backendResponse.headers,
-    );
+    if (backendResponse.status >= 300) {
+      const err = new Error(backendResponse.data);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (err as any).statusCode = backendResponse.status;
+      throw err;
+    }
 
     const metadata: CachedMetadata = {
-      statusCode: backendResponse.statusCode,
+      statusCode: backendResponse.status,
       headers: backendResponse.headers,
       createdAt: Date.now(),
     };
@@ -225,18 +250,19 @@ export class HttpCachingProxy {
     // Since this proxy is for testing only, buffering the entire
     // response body is acceptable.
 
+    let data = backendResponse.data;
+    if (typeof data !== 'string') {
+      data = JSON.stringify(data);
+    }
     await cacache.put(
       this._options.cachePath,
       this._getCacheKey(clientRequest),
-      backendResponse.body,
+      data,
       {metadata},
     );
 
-    clientResponse.writeHead(
-      backendResponse.statusCode,
-      backendResponse.headers,
-    );
-    clientResponse.end(backendResponse.body);
+    clientResponse.writeHead(backendResponse.status, backendResponse.headers);
+    clientResponse.end(data);
   }
 
   public logError(request: IncomingMessage, error: Error) {
